@@ -1,0 +1,306 @@
+---
+  html_document:
+    toc: true
+    highlight: zenburn
+    theme: united
+---
+
+```{r setup, echo=FALSE}
+knitr::opts_chunk$set(tidy=TRUE, highlight=TRUE, dev="png",
+               cache=FALSE, highlight=TRUE, autodep=TRUE, warning=FALSE,
+               error=FALSE, message=FALSE, prompt=TRUE, comment='', fig.cap='')
+```
+
+## Report for Wen's new set of data
+Cells: We sorted the MLV infected H9 cells on day 10. Two fractions:
+day 10 MLV-GFP pos and neg. We culture the pos fraction till day 20,
+and sort again. We got day 20 pos and neg (there are high percentage
+of pos cells). It is interesting why some virus is still actively
+expressing on day 20, which should be completely be silenced on
+day 20. The hypothesis is that because we selected on day 10 pos, we
+selected virus that integrate into very active genomic regions so they
+kept expressing even on day 20. Therefore, we are very interested in
+seeing the integration sites and surrounding environment of the sites.
+
+DNA: I extracted the DNA of day 10 pos, day 10 neg, day 20 pos, day 20
+neg. I amplified the integration sites of MLV. each sample was
+amplified in replicates using different barcodes. So totally there are
+8 pairs of barcodes and 4 samples. Then I mixed the samples. According
+to the gel, the amplicon is 300-1000bp.
+
+All the rest of the setting is exactly the same from last time's Miseq.
+
+## Analysis strategy
+We did this similar to a previous experiment that I ran with Jon Li; we took
+the full MLV sequence and then aligned the reads to the human genome plus
+the MLV sequence. We then took reads that had one part of the reads in
+human and the other part of the read in MLV. This is different than what we
+did before, where before we identified the sequences that had MLV attached,
+trimmed them of and then aligned them. It isn't clear which method is a better
+way of going about it, there are pros and cons for both.
+
+```{r load-libraries, echo=FALSE}
+library(dplyr)
+library(ggplot2)
+library(knitr)
+```
+
+```{r format-data, echo=FALSE}
+files = c("TTCACAA.sites", "TTCAGAT.sites", "TTCAGCA.sites", "TTCATAG.sites",
+          "TTCATGA.sites", "TTGAAAG.sites", "TTGAGAA.sites", "TTGATAC.sites")
+
+all <- data.frame()
+for (file in files) {
+  sample <- read.table(file, header=TRUE, sep=" ")
+  sample$fname <- file
+  all <- rbind(sample, all)
+}
+all$barcode <- gsub(".sites", "", all$fname, fixed=TRUE)
+
+sampledata <- read.csv("sampledata.csv", header=TRUE, sep=",")
+
+merged <- merge(all, sampledata, by="barcode")
+merged$loc <- paste(merged$chrom, merged$pos, sep=":")
+```
+
+```{r reads-per-sample}
+nreads = read.table("reads.txt", header=TRUE, sep=",", stringsAsFactors=FALSE)
+merged = merge(merged, nreads, by="barcode")
+```
+
+
+## Exploratory analysis
+```{r filter-multimappers}
+canonical = c(paste("chr", seq(22), sep=""), "chrX", "chrY")
+filtered = merged %>% filter(mapq > 10 & chrom %in% canonical)
+filtered$chrom = factor(filtered$chrom, levels=canonical)
+filtered$sample_id = paste(filtered$sample, filtered$replicate, sep="-")
+```
+We dropped all of the alignments with a quality score less than 10. This
+restricts us to alignments where we think we have at least a 90% certainty
+we know the location in the genome it is mapping to.
+
+We started with `r nrow(merged)` chimeric alignments and were left with `r nrow(filtered)`. These alignments are alignments that have one end in the human sequence and the other end in the MLV genome.
+
+Here is a breakdown of the number of chimeric alignments we kept by sample and
+how many reads per chimeric read. We can see there is quite a bit of variation
+between the number of reads it takes to see a chimeric alignment. The day 20
+positive samples have a much higher enrichment for chimeric alignments.
+
+```{r alignments-table, results='asis'}
+counts = filtered %>% group_by(sample, barcode, reads) %>% summarise(alignments=n()) %>%
+    mutate(reads_until_chimeric=reads/alignments)
+kable(counts)
+```
+
+These cells weren't grown up from clones, so we should expect to see a fairly
+heterogeneous mix of sites within each sample. The table above was the total
+number of alignments. Below is the number of unique integration sites.
+reads_until_site here is how many reads we sequenced between seeing a new
+site (total reads / total number of sites).
+
+```{r sites-table}
+sites = filtered %>% group_by(sample, barcode, loc, reads) %>%
+        summarise(sites=n()) %>% group_by(sample, barcode, reads) %>%
+        summarise(sites=n()) %>% mutate(reads_until_site=reads/sites)
+kable(sites)
+```
+
+We see a smaller number of unique sites in the Day10 cells than the Day20 cells, however we found more total alignments in the Day20 cells as well. This doesn't
+have much to o with the depth of sequencing, since we had less reads sequenced
+in the Day20 cells than the Day10 cells.
+
+If there are certain integration sites that are specific to the Day20 cells that
+are still expressing, when we might see some sites with more reads associated
+with them than the Day20 negative or the Day10 cells. Here we count the number
+of sites with more than 20 alignments of evidence:
+
+```{r sites-table-20-alignments}
+sites = filtered %>% group_by(sample, barcode, loc) %>%
+  summarise(alignments=n()) %>% filter(alignments > 20) %>%
+  group_by(sample, barcode) %>% summarise(sites=n())
+kable(sites)
+```
+
+There isn't evidence for there being more high depth sites than not in the Day 20
+positive samples, too bad. But there is evidence for more sites in general
+in the Day20 samples than the Day10 samples.
+
+Maybe certain chromosomes are enriched in the Day20 positive samples compared
+to the Day20 negative samples:
+
+```{r chrom-table}
+sites = filtered %>% group_by(sample, replicate, barcode, loc, chrom) %>%
+        summarise(sites=n()) %>% group_by(sample, chrom, replicate) %>%
+        summarise(sites=n())
+ggplot(sites, aes(chrom, sites)) +
+    geom_bar(stat='identity') +
+    facet_wrap(~ sample + replicate) +
+    theme_bw(base_size=10) +
+    theme(panel.grid.major = element_line(size = .5, color = "grey"),
+          axis.text.x = element_text(angle=90))
+```
+
+Maybe, hard to tell without more replicates if any of these are different or not.
+Normalizing by chromosome:
+
+```{r chromosome-sizes}
+chromsizes = read.table("../metadata/hiv_mlv.fa.fai", header=FALSE, sep="\t")[, c(1:2)]
+colnames(chromsizes) = c("chrom", "chromsize")
+sites = merge(sites, chromsizes, by="chrom")
+sites$normcounts = sites$sites/sites$chromsize
+ggplot(sites, aes(chrom, normcounts)) +
+    geom_bar(stat='identity') +
+    facet_wrap(~ sample + replicate) +
+    theme_bw(base_size=10) +
+    theme(panel.grid.major = element_line(size = .5, color = "grey"),
+          axis.text.x = element_text(angle=90))
+```
+
+Do the 20 positive samples share more sites in common than the 20 negative
+samples? Here we take all of the samples and calculate the overlap between
+their sites. The number in the bar chart is the number of sites that overlap
+between the samples connected together on the key at the bottom.
+
+```{r positive-sets}
+nodupes <- filtered %>% dplyr:::select(sample, replicate, loc) %>%
+           group_by(sample, replicate, loc) %>% summarise(counts=n())
+
+library(UpSetR)
+library(tidyr)
+z <- nodupes[, c("sample", "loc", "replicate")]
+z$full <- paste(z$sample, z$replicate, sep="-")
+z <- z[, c("full", "loc")]
+z$value <- TRUE
+z <- z %>% spread(key=full, value=value)
+z[is.na(z)] <- FALSE
+rownames(z) <- z$loc
+z[, c(2:ncol(z))] <- z[, c(2:ncol(z))] * 1
+z <- data.frame(z)
+colnames(z) <- gsub("X151.Lib.", "", colnames(z))
+colnames(z) <- gsub(".", "_", colnames(z), fixed=TRUE)
+upset(z, sets.bar.color = "#56B4E9", nsets=8)
+```
+
+Not too convincing. What if we slim it down and only look at sites that are
+repesented by 10 unique alignments or more?
+
+```{r positive-large-sets}
+large <- subset(nodupes, counts > 10)
+y <- large[, c("sample", "loc", "replicate")]
+y$full <- paste(y$sample, y$replicate, sep="-")
+y <- y[, c("full", "loc")]
+y$value <- TRUE
+y <- y %>% spread(key=full, value=value)
+y[is.na(y)] <- FALSE
+rownames(y) <- y$loc
+y[, c(2:ncol(y))] <- y[, c(2:ncol(y))] * 1
+y <- data.frame(y)
+colnames(y) <- gsub("X151.Lib.", "", colnames(y))
+colnames(y) <- gsub(".", "_", colnames(y), fixed=TRUE)
+upset(y, sets.bar.color = "#56B4E9", nsets=8)
+```
+
+It looks like the 20 day negative samples have more sites in common that
+have a larger number of reads than the positive samples, which is kind
+of backwards from what I was expecting.
+
+Now we will dump out a BED file of all the sites for each sample and then
+intersect it with a BED file of known genes, maybe there is an enrichment
+for genes that are hit the same.
+
+```{r write-bed}
+sites = filtered %>% group_by(chrom, pos, sample_id, barcode) %>%
+        summarise(sites=n()) %>% dplyr:::select(chrom, pos,  sample_id, sites)
+sites = sites[, c("chrom", "pos", "pos", "sample_id", "sites")]
+write.table(sites, file="sites.bed", row.names=FALSE, col.names=FALSE,
+            quote=FALSE, sep="\t")
+sites_annotated = read.table("sites-annotated.bed", header=FALSE,
+                             stringsAsFactors=FALSE)
+sites_annotated = sites_annotated[, c(1, 2, 4, 5, 9)]
+colnames(sites_annotated) = c("chrom", "pos", "sample", "count", "gene_id")
+```
+
+Grouping for common genes instead of common sites:
+
+```{r gene-sites}
+sites = sites_annotated %>% group_by(sample, gene_id) %>%
+        summarise(sites=n()) %>% filter(gene_id != ".")
+y = sites[, c("sample", "gene_id")]
+y$value <- TRUE
+y <- y %>% spread(key=sample, value=value)
+y[is.na(y)] <- FALSE
+rownames(y) <- y$gene_id
+y[, c(2:ncol(y))] <- y[, c(2:ncol(y))] * 1
+y <- data.frame(y)
+colnames(y) <- gsub("X151.Lib.", "", colnames(y))
+colnames(y) <- gsub(".", "_", colnames(y), fixed=TRUE)
+upset(y, sets.bar.color = "#56B4E9", nsets=8)
+```
+
+This shows that the negative samples tend to have the gene the HIV is in
+in common, which is the opposite effect we thought we might show.
+
+Below is a table of all of the genes that have integration sites in the positive
+samples. "positive_only" are sites only in the MLV positive cells.
+"day20_positive" are sites in either day20_positive sample and not in any
+negative samples. day20_positive_both are in both day20 positive samples and not
+in any negative samples.
+
+```{r positive-only}
+positive_only = data.frame(id=rownames(y)[(y$Day20_pos_1 | y$Day20_pos_2 |
+                            y$Day10_pos_1 |
+                             y$Day10_pos_2) & !y$Day20_neg_1 & !y$Day20_neg_2 &
+                             !y$Day10_neg_1 & !y$Day10_neg_2],
+                           type="positive_only")
+
+day20_positive = data.frame(id=rownames(y)[(y$Day20_pos_1 | y$Day20_pos_2) &
+                             !y$Day20_neg_1 &
+                             !y$Day20_neg_2 & !y$Day10_neg_1 & !y$Day10_neg_2],
+                            type="day20_positive")
+
+day20_positive_both = data.frame(id=rownames(y)[(y$Day20_pos_1 & y$Day20_pos_2) &
+                             !y$Day20_neg_1 &
+                             !y$Day20_neg_2 & !y$Day10_neg_1 & !y$Day10_neg_2],
+                            type="day20_positive_both")
+all = rbind(positive_only, day20_positive, day20_positive_both)
+library(biomaRt)
+mart = useMart("ensembl", dataset="hsapiens_gene_ensembl")
+conversions = getBM(mart=mart, attributes=c("ensembl_gene_id", "hgnc_symbol"))
+all = merge(all, conversions, by.x="id", by.y="ensembl_gene_id")
+all = unique(all)
+all = subset(all, hgnc_symbol != "")
+all = all[order(all$type),]
+kable(all)
+```
+
+```{r write-all-table}
+write.table(all, file="sites-annotated.tsv", row.names=FALSE, col.names=TRUE,
+            quote=FALSE, sep="\t")
+```
+
+Here we look at number of sites that are in intron/exon/intergenic/promoter regions. We can see for the Day20 positive samples, they are more likely to be in the introns of genes, and be in genes in general. Again this would have to be something that needs biological replicates to have a firm conclusion about, but it is something to look at at least. The integration sites tend to be in the introns in genes and not in intergenic regions which is a good sanity check.
+
+```{r sites-promoters}
+x = read.table("sites-annotated-promoters.bed", header=FALSE, sep="\t", stringsAsFactors=FALSE)
+x = x[, c(1, 2, 3, 4, 5, 9, 10, 11)]
+colnames(x) = c("chrom", "start", "end", "sample", "counts", "symbol", "feature", "gene")
+x$feature[x$feature == "."] = "intergenic"
+sites = x %>% group_by(sample, feature) %>%
+        summarise(sites=n()) %>% mutate(total=sum(sites))
+ggplot(sites, aes(feature, sites/total, fill=sample)) +
+    geom_bar(stat='identity', position='dodge') +
+    theme_bw(base_size=10) + xlab("")
+```
+
+```{r sites-promoters-counts}
+x = read.table("sites-annotated-promoters.bed", header=FALSE, sep="\t", stringsAsFactors=FALSE)
+x = x[, c(1, 2, 3, 4, 5, 9, 10, 11)]
+colnames(x) = c("chrom", "start", "end", "sample", "counts", "symbol", "feature", "gene")
+x$feature[x$feature == "."] = "intergenic"
+sites = x %>% group_by(sample, feature) %>%
+        summarise(alignments=sum(counts)) %>% mutate(total=sum(alignments))
+ggplot(sites, aes(feature, alignments/total, fill=sample)) +
+    geom_bar(stat='identity', position='dodge') +
+    theme_bw(base_size=10) + xlab("")
+```
